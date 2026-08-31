@@ -88,30 +88,43 @@ class Brats(Dataset):
 
 
 def get_datasets(seed, debug, no_seg=False, on="train", full=False,
-                 fold_number=0, normalisation="minmax", exclude_ids=None):
+                 fold_number=0, normalisation="minmax", exclude_ids=None, drop_corrupt_ids=None):
     """exclude_ids: optional iterable of patient-dir names (e.g. "BraTS20_Training_141")
     to drop from the *training* split only -- for the "filtered/cleaned dataset"
     Pipeline-A variant (cases flagged as high-training-loss by
     src/find_noisy_patients.py). Val/benchmark sets for the fold are left
     untouched on purpose, so a filtered-vs-unfiltered comparison for the same
     fold is evaluated on exactly the same held-out patients.
+
+    drop_corrupt_ids: optional iterable of patient-dir names to drop from EVERY
+    split (train, val, and benchmark) -- for a case whose files are genuinely
+    missing/corrupt on disk (e.g. an incomplete dataset extraction) and would
+    otherwise crash a DataLoader worker. Applied *after* the KFold split is
+    computed, so it never shifts which patients land in which fold -- safe to
+    add mid-run without invalidating a checkpoint already saved for this fold.
     """
     base_folder = pathlib.Path(get_brats_folder(on)).resolve()
     print(base_folder)
     assert base_folder.exists()
     patients_dir = sorted([x for x in base_folder.iterdir() if x.is_dir()])
     exclude_ids = set(exclude_ids) if exclude_ids else set()
+    drop_corrupt_ids = set(drop_corrupt_ids) if drop_corrupt_ids else set()
     if full:
-        train_patients = [p for p in patients_dir if p.name not in exclude_ids]
+        train_patients = [p for p in patients_dir if p.name not in exclude_ids | drop_corrupt_ids]
         if exclude_ids:
-            print(f"Excluded {len(patients_dir) - len(train_patients)} patient(s) from "
-                  f"training (of {len(exclude_ids)} requested): {sorted(exclude_ids)}")
+            print(f"Excluded {len(patients_dir) - len(train_patients) - len([p for p in patients_dir if p.name in drop_corrupt_ids])} "
+                  f"patient(s) from training (of {len(exclude_ids)} requested): {sorted(exclude_ids)}")
+        bench_patients = [p for p in patients_dir if p.name not in drop_corrupt_ids]
+        if drop_corrupt_ids:
+            print(f"Dropped {len(patients_dir) - len(bench_patients)} corrupt patient(s) from every "
+                  f"split (of {len(drop_corrupt_ids)} requested): {sorted(drop_corrupt_ids)}")
         train_dataset = Brats(train_patients, training=True, debug=debug,
                               normalisation=normalisation)
-        bench_dataset = Brats(patients_dir, training=False, benchmarking=True, debug=debug,
+        bench_dataset = Brats(bench_patients, training=False, benchmarking=True, debug=debug,
                               normalisation=normalisation)
         return train_dataset, bench_dataset
     if no_seg:
+        patients_dir = [p for p in patients_dir if p.name not in drop_corrupt_ids]
         return Brats(patients_dir, training=False, debug=debug,
                      no_seg=no_seg, normalisation=normalisation)
     kfold = KFold(5, shuffle=True, random_state=seed)
@@ -127,6 +140,13 @@ def get_datasets(seed, debug, no_seg=False, on="train", full=False,
         print(f"Excluded {before - len(train)} patient(s) from fold {fold_number}'s training "
               f"split (of {len(exclude_ids)} requested -- some may belong to this fold's val "
               f"split instead, where they are deliberately left in): {sorted(exclude_ids)}")
+    if drop_corrupt_ids:
+        before_train, before_val = len(train), len(val)
+        train = [p for p in train if p.name not in drop_corrupt_ids]
+        val = [p for p in val if p.name not in drop_corrupt_ids]
+        print(f"Dropped corrupt patient(s) from fold {fold_number}: "
+              f"{before_train - len(train)} from train, {before_val - len(val)} from val "
+              f"(of {len(drop_corrupt_ids)} requested): {sorted(drop_corrupt_ids)}")
     # return patients_dir
     train_dataset = Brats(train, training=True,  debug=debug,
                           normalisation=normalisation)

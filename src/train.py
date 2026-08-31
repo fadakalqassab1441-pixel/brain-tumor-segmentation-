@@ -67,6 +67,16 @@ parser.add_argument('--exclude_patients', default='', type=str, metavar='PATH',
                          'the training split only -- for the filtered/cleaned-dataset Pipeline-A '
                          'variant. Generate this file with src/find_noisy_patients.py against a '
                          'baseline run\'s patients_indiv_perf.csv. Val/benchmark sets are unaffected.')
+parser.add_argument('--drop_corrupt', default='', type=str, metavar='PATH',
+                    help='path to a text file of patient-dir names (one per line) to drop from '
+                         'EVERY split (train, val, and benchmark) for this fold -- unlike '
+                         '--exclude_patients, this is not affected. Use this only for a case whose '
+                         'files are genuinely missing/corrupt on disk (e.g. an incomplete dataset '
+                         'extraction) and cannot be repaired, so a DataLoader worker crash on that '
+                         'one patient does not take down the whole run. Removal happens *after* the '
+                         'KFold train/val split is computed, so it does not shift which patients '
+                         'land in which fold -- safe to add mid-run without invalidating a checkpoint '
+                         'already saved for this fold.')
 
 
 def main(args):
@@ -185,9 +195,17 @@ def main(args):
         print(f"Loaded {len(exclude_ids)} patient(s) to exclude from training, "
               f"from {args.exclude_patients}")
 
+    drop_corrupt_ids = None
+    if args.drop_corrupt:
+        with open(args.drop_corrupt) as f:
+            drop_corrupt_ids = [line.strip() for line in f if line.strip()]
+        print(f"Loaded {len(drop_corrupt_ids)} patient(s) to drop from EVERY split (corrupt/missing "
+              f"files), from {args.drop_corrupt}")
+
     if args.full:
         train_dataset, bench_dataset = get_datasets(args.seed, args.debug, full=True,
-                                                     exclude_ids=exclude_ids)
+                                                     exclude_ids=exclude_ids,
+                                                     drop_corrupt_ids=drop_corrupt_ids)
 
         train_loader = torch.utils.data.DataLoader(
             train_dataset, batch_size=args.batch_size, shuffle=True,
@@ -199,7 +217,8 @@ def main(args):
     else:
 
         train_dataset, val_dataset, bench_dataset = get_datasets(args.seed, args.debug, fold_number=args.fold,
-                                                                  exclude_ids=exclude_ids)
+                                                                  exclude_ids=exclude_ids,
+                                                                  drop_corrupt_ids=drop_corrupt_ids)
 
         train_loader = torch.utils.data.DataLoader(
             train_dataset, batch_size=args.batch_size, shuffle=True,
