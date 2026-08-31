@@ -39,10 +39,17 @@ def master_do(func, *args, **kwargs):
         func(*args, **kwargs)
 
 
-def save_checkpoint(state: dict, save_folder: pathlib.Path):
-    """Save Training state."""
-    best_filename = f'{str(save_folder)}/model_best.pth.tar'
-    torch.save(state, best_filename)
+def save_checkpoint(state: dict, save_folder: pathlib.Path, filename: str = "model_best.pth.tar"):
+    """Save Training state.
+
+    filename defaults to "model_best.pth.tar" to keep every existing call site
+    (best-so-far tracking, and the final/SWA checkpoint used for inference)
+    working exactly as before. Pass filename="checkpoint_latest.pth.tar" for the
+    periodic resume checkpoint saved every epoch (main phase) / every SWA cycle
+    (swa phase) -- see reload_ckpt below.
+    """
+    out_path = f'{str(save_folder)}/{filename}'
+    torch.save(state, out_path)
 
 
 class AverageMeter(object):
@@ -93,18 +100,39 @@ class ProgressMeter(object):
 
 
 # TODO remove dependency to args
-def reload_ckpt(args, model, optimizer, scheduler):
-    if os.path.isfile(args.resume):
-        print("=> loading checkpoint '{}'".format(args.resume))
-        checkpoint = torch.load(args.resume)
-        args.start_epoch = checkpoint['epoch']
-        model.load_state_dict(checkpoint['state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        scheduler.load_state_dict(checkpoint['scheduler'])
-        print("=> loaded checkpoint '{}' (epoch {})"
-              .format(args.resume, checkpoint['epoch']))
-    else:
+def reload_ckpt(args, model, optimizer):
+    """Load a checkpoint to resume training after an interruption (e.g. a Colab
+    disconnect) -- point --resume at a "checkpoint_latest.pth.tar" written by the
+    periodic-save added to train.py's main loop / SWA loop.
+
+    This used to take a `scheduler` argument and crash immediately (train.py only
+    ever called it with 3 args, `reload_ckpt(args, model, optimizer)`, so `--resume`
+    raised TypeError before touching a single epoch). Fixed by not requiring the
+    scheduler here at all: for a "main"-phase checkpoint the scheduler doesn't exist
+    yet at this point in main() (it's created further down), so we hand the raw
+    checkpoint dict back to the caller, which applies checkpoint['scheduler'] once
+    the scheduler object exists. For a "swa"-phase checkpoint there's nothing to
+    restore here (each SWA cycle gets a fresh optimizer/scheduler by design) -- the
+    caller uses the returned dict to restore swa_model / swa_model_optim instead and
+    skip straight to the right cycle.
+
+    Sets args.start_epoch, args.resume_phase ("main" or "swa"), and args.resume_best
+    for the caller's convenience, and returns the full checkpoint dict.
+    """
+    if not os.path.isfile(args.resume):
         raise ValueError("=> no checkpoint found at '{}'".format(args.resume))
+    print("=> loading checkpoint '{}'".format(args.resume))
+    checkpoint = torch.load(args.resume, map_location="cpu")
+    model.load_state_dict(checkpoint['state_dict'])
+    phase = checkpoint.get('phase', 'main')
+    if optimizer is not None and phase == 'main' and 'optimizer' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+    args.start_epoch = checkpoint['epoch'] + 1
+    args.resume_phase = phase
+    args.resume_best = checkpoint.get('best', np.inf)
+    print("=> loaded checkpoint '{}' (epoch {}, phase {})"
+          .format(args.resume, checkpoint['epoch'], phase))
+    return checkpoint
 
 
 def reload_ckpt_bis(ckpt, model, optimizer=None):

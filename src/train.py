@@ -62,6 +62,11 @@ parser.add_argument('--com', help="add a comment to this run!")
 parser.add_argument('--dropout', type=float, help="amount of dropout to use", default=0.)
 parser.add_argument('--warm_restart', action='store_true', help='use scheduler warm restarts with period of 30')
 parser.add_argument('--full', action='store_true', help='Fit the network on the full training set')
+parser.add_argument('--exclude_patients', default='', type=str, metavar='PATH',
+                    help='path to a text file of patient-dir names (one per line) to drop from '
+                         'the training split only -- for the filtered/cleaned-dataset Pipeline-A '
+                         'variant. Generate this file with src/find_noisy_patients.py against a '
+                         'baseline run\'s patients_indiv_perf.csv. Val/benchmark sets are unaffected.')
 
 
 def main(args):
@@ -161,17 +166,28 @@ def main(args):
         optimizer = Ranger(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         rangered = True
 
-    # optionally resume from a checkpoint
+    # optionally resume from a checkpoint (point --resume at a run's
+    # checkpoint_latest.pth.tar to continue after a Colab disconnect --
+    # see utils.reload_ckpt's docstring for what this used to do wrong)
+    resume_ckpt = None
     if args.resume:
-        reload_ckpt(args, model, optimizer)
+        resume_ckpt = reload_ckpt(args, model, optimizer)
 
     if args.debug:
         args.epochs = 2
         args.warm = 0
         args.val = 1
 
+    exclude_ids = None
+    if args.exclude_patients:
+        with open(args.exclude_patients) as f:
+            exclude_ids = [line.strip() for line in f if line.strip()]
+        print(f"Loaded {len(exclude_ids)} patient(s) to exclude from training, "
+              f"from {args.exclude_patients}")
+
     if args.full:
-        train_dataset, bench_dataset = get_datasets(args.seed, args.debug, full=True)
+        train_dataset, bench_dataset = get_datasets(args.seed, args.debug, full=True,
+                                                     exclude_ids=exclude_ids)
 
         train_loader = torch.utils.data.DataLoader(
             train_dataset, batch_size=args.batch_size, shuffle=True,
@@ -182,7 +198,8 @@ def main(args):
 
     else:
 
-        train_dataset, val_dataset, bench_dataset = get_datasets(args.seed, args.debug, fold_number=args.fold)
+        train_dataset, val_dataset, bench_dataset = get_datasets(args.seed, args.debug, fold_number=args.fold,
+                                                                  exclude_ids=exclude_ids)
 
         train_loader = torch.utils.data.DataLoader(
             train_dataset, batch_size=args.batch_size, shuffle=True,
@@ -203,7 +220,7 @@ def main(args):
 
     # Actual Train loop
 
-    best = np.inf
+    best = args.resume_best if args.resume else np.inf
     print("start warm-up now!")
     if args.warm != 0:
         tot_iter_train = len(train_loader)
@@ -239,6 +256,13 @@ def main(args):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,
                                                                args.epochs + 30 if not rangered else round(
                                                                    args.epochs * 0.5))
+
+    if args.resume and resume_ckpt is not None and resume_ckpt.get('phase', 'main') == 'main' \
+            and 'scheduler' in resume_ckpt:
+        # only a "main"-phase checkpoint has a scheduler to restore -- the scheduler
+        # object didn't exist yet back when reload_ckpt() loaded the model/optimizer
+        scheduler.load_state_dict(resume_ckpt['scheduler'])
+        print(f"=> restored main-phase scheduler state (resuming at epoch {args.start_epoch})")
     print("start training now!")
     if args.swa:
         # c = 15, k=3, repeat = 5
@@ -248,7 +272,16 @@ def main(args):
         if args.debug:
             c, k, repeat = 2, 1, 2
 
-    for epoch in range(args.start_epoch + args.warm, args.epochs + args.warm):
+    # Resuming a "main"-phase checkpoint: args.start_epoch is already the next
+    # absolute epoch to run (reload_ckpt sets it to checkpoint['epoch'] + 1), so
+    # don't add args.warm again on top of it (that was the second resume bug --
+    # it used to skip ahead by args.warm epochs every time --resume was used).
+    # Resuming a "swa"-phase checkpoint: the main loop is already fully done: make
+    # this an empty range so it's skipped entirely, straight to the SWA block below.
+    resuming_into_swa = args.resume and resume_ckpt is not None and resume_ckpt.get('phase', 'main') == 'swa'
+    main_loop_start = args.start_epoch if args.resume else args.warm
+    main_loop_end = main_loop_start if resuming_into_swa else args.epochs + args.warm
+    for epoch in range(main_loop_start, main_loop_end):
         try:
             # do_epoch for one epoch
             ts = time.perf_counter()
@@ -298,17 +331,59 @@ def main(args):
                     scheduler.step()
                     print("scheduler stepped!")
 
+            # Periodic resume checkpoint -- every epoch, regardless of whether this
+            # epoch improved on `best`. If save_folder lives on a mounted Google
+            # Drive, a Colab disconnect loses at most the epoch in progress; point
+            # --resume at this file (not model_best.pth.tar) to continue.
+            save_checkpoint(
+                dict(
+                    epoch=epoch, arch=args.arch, phase="main",
+                    state_dict=model.state_dict(),
+                    optimizer=optimizer.state_dict(),
+                    scheduler=scheduler.state_dict(),
+                    best=best,
+                ),
+                save_folder=args.save_folder, filename="checkpoint_latest.pth.tar")
+
         except KeyboardInterrupt:
             print("Stopping training loop, doing benchmark")
             break
 
     if args.swa:
-        swa_model_optim.update(model)
-        print("SWA Model initialised!")
-        for i in range(repeat):
+        # Per-epoch checkpointing inside SWA cycles (below) means a resume can
+        # land either "cycle just finished" or "partway through a cycle" --
+        # resume_swa_epoch tracks which, and drives both the cycle to start at
+        # and, when partway, which epoch inside it to continue from.
+        if resuming_into_swa:
+            swa_model.load_state_dict(resume_ckpt['swa_state_dict'])
+            swa_model_optim.num_params = resume_ckpt['swa_num_params']
+            start_cycle = resume_ckpt['swa_cycle']
+            resume_swa_epoch = resume_ckpt.get('swa_epoch_in_cycle', c - 1)
+            if resume_swa_epoch >= c - 1:
+                # that cycle had already fully finished -- move on, fresh
+                start_cycle += 1
+                resume_swa_epoch = -1
+            print(f"=> resuming SWA phase at cycle {start_cycle}/{repeat}, "
+                  f"epoch {resume_swa_epoch + 1}/{c} within that cycle "
+                  f"(swa_model_optim.num_params={swa_model_optim.num_params})")
+        else:
+            swa_model_optim.update(model)
+            print("SWA Model initialised!")
+            start_cycle = 0
+            resume_swa_epoch = -1
+        for i in range(start_cycle, repeat):
             optimizer = torch.optim.Adam(model.parameters(), args.lr / 2, weight_decay=args.weight_decay)
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, c + 10)
-            for swa_epoch in range(c):
+            swa_epoch_start = 0
+            if resuming_into_swa and i == start_cycle and resume_swa_epoch >= 0:
+                # continuing a cycle that was interrupted partway through: each
+                # cycle gets its own fresh Adam + cosine schedule, so it's this
+                # cycle's optimizer/scheduler state that needs restoring here --
+                # reload_ckpt() only handled the outer main-phase optimizer.
+                optimizer.load_state_dict(resume_ckpt['swa_optimizer'])
+                scheduler.load_state_dict(resume_ckpt['swa_scheduler'])
+                swa_epoch_start = resume_swa_epoch + 1
+            for swa_epoch in range(swa_epoch_start, c):
                 # do_epoch for one epoch
                 ts = time.perf_counter()
                 model.train()
@@ -343,6 +418,23 @@ def main(args):
                         t_writer.add_scalar(f"SummaryLoss/overfit", validation_loss - training_loss, current_epoch)
                         t_writer.add_scalar(f"SummaryLoss/overfit_swa", swa_model_loss - training_loss, current_epoch)
                 scheduler.step()
+
+                # Per-epoch resume checkpoint -- same idea as the main phase
+                # above, now inside the SWA cycle too. A Colab disconnect loses
+                # at most this one epoch, never the rest of the ~30-epoch cycle
+                # (previously this only saved once per cycle, at the boundary,
+                # so up to c-1 epochs of progress could be lost).
+                save_checkpoint(
+                    dict(
+                        epoch=current_epoch, arch=args.arch, phase="swa",
+                        swa_cycle=i, swa_epoch_in_cycle=swa_epoch,
+                        state_dict=model.state_dict(),
+                        swa_state_dict=swa_model.state_dict(),
+                        swa_num_params=swa_model_optim.num_params,
+                        swa_optimizer=optimizer.state_dict(),
+                        swa_scheduler=scheduler.state_dict(),
+                    ),
+                    save_folder=args.save_folder, filename="checkpoint_latest.pth.tar")
         epochs_added = c * repeat
         save_checkpoint(
             dict(

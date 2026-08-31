@@ -358,6 +358,10 @@ class CascadedSEUnet(nn.Module):
     CascadedSEUnet` with no other code changes.
     """
     name = "CascadedSEUnet"
+    # Overridden by CascadedSEUnetAtt below to get CBAM-attention encoder stages
+    # (mirroring how Att_EquiUnet swaps UBlockCbam in for UBlock) without
+    # duplicating the whole class body.
+    _encoder_block = UBlock
 
     def __init__(self, inplanes, num_classes, width, norm_layer=None, deep_supervision=False, dropout=0,
                  coarse_width=None, se_reduction=8, **kwargs):
@@ -374,12 +378,13 @@ class CascadedSEUnet(nn.Module):
         fine_inplanes = inplanes + num_classes  # original modalities + coarse guidance map
         print(features)
 
-        self.encoder1 = UBlock(fine_inplanes, features[0], features[0], norm_layer, dropout=dropout)
-        self.encoder2 = UBlock(features[0], features[1], features[1], norm_layer, dropout=dropout)
-        self.encoder3 = UBlock(features[1], features[2], features[2], norm_layer, dropout=dropout)
-        self.encoder4 = UBlock(features[2], features[3], features[3], norm_layer, dropout=dropout)
+        eb = self._encoder_block
+        self.encoder1 = eb(fine_inplanes, features[0], features[0], norm_layer, dropout=dropout)
+        self.encoder2 = eb(features[0], features[1], features[1], norm_layer, dropout=dropout)
+        self.encoder3 = eb(features[1], features[2], features[2], norm_layer, dropout=dropout)
+        self.encoder4 = eb(features[2], features[3], features[3], norm_layer, dropout=dropout)
 
-        self.bottom = UBlock(features[3], features[3], features[3], norm_layer, (2, 2), dropout=dropout)
+        self.bottom = eb(features[3], features[3], features[3], norm_layer, (2, 2), dropout=dropout)
 
         self.bottom_2 = nn.Sequential(
             ConvBnRelu(features[3] * 2, features[2], norm_layer, dropout=dropout),
@@ -470,4 +475,19 @@ class CascadedSEUnet(nn.Module):
 
         return out
 
-        self._init_weights()
+
+class CascadedSEUnetAtt(CascadedSEUnet):
+    """CascadedSEUnet with a CBAM-attention encoder.
+
+    Mirrors how Att_EquiUnet swaps UBlockCbam in for UBlock on top of the plain
+    EquiUnet body: same coarse-to-fine cascade and SE-gated decoder as
+    CascadedSEUnet, but encoder1..4 and the dilated `bottom` stage use
+    UBlockCbam (channel + spatial attention) instead of plain UBlock, exactly
+    like the reference paper's "3D attention U-net version" of its own U-Net.
+    This is the third of the three per-fold Pipeline-A variants: (1) this
+    attention encoder, (2) plain CascadedSEUnet on the unfiltered dataset, and
+    (3) plain CascadedSEUnet on a filtered/cleaned dataset (see
+    dataset/brats.py's `exclude_ids` and the patient-filtering helper script).
+    """
+    name = "CascadedSEUnetAtt"
+    _encoder_block = UBlockCbam

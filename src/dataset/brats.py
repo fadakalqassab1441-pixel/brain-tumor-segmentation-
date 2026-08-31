@@ -88,13 +88,25 @@ class Brats(Dataset):
 
 
 def get_datasets(seed, debug, no_seg=False, on="train", full=False,
-                 fold_number=0, normalisation="minmax"):
+                 fold_number=0, normalisation="minmax", exclude_ids=None):
+    """exclude_ids: optional iterable of patient-dir names (e.g. "BraTS20_Training_141")
+    to drop from the *training* split only -- for the "filtered/cleaned dataset"
+    Pipeline-A variant (cases flagged as high-training-loss by
+    src/find_noisy_patients.py). Val/benchmark sets for the fold are left
+    untouched on purpose, so a filtered-vs-unfiltered comparison for the same
+    fold is evaluated on exactly the same held-out patients.
+    """
     base_folder = pathlib.Path(get_brats_folder(on)).resolve()
     print(base_folder)
     assert base_folder.exists()
     patients_dir = sorted([x for x in base_folder.iterdir() if x.is_dir()])
+    exclude_ids = set(exclude_ids) if exclude_ids else set()
     if full:
-        train_dataset = Brats(patients_dir, training=True, debug=debug,
+        train_patients = [p for p in patients_dir if p.name not in exclude_ids]
+        if exclude_ids:
+            print(f"Excluded {len(patients_dir) - len(train_patients)} patient(s) from "
+                  f"training (of {len(exclude_ids)} requested): {sorted(exclude_ids)}")
+        train_dataset = Brats(train_patients, training=True, debug=debug,
                               normalisation=normalisation)
         bench_dataset = Brats(patients_dir, training=False, benchmarking=True, debug=debug,
                               normalisation=normalisation)
@@ -109,6 +121,12 @@ def get_datasets(seed, debug, no_seg=False, on="train", full=False,
     print("first idx of test", val_idx[0])
     train = [patients_dir[i] for i in train_idx]
     val = [patients_dir[i] for i in val_idx]
+    if exclude_ids:
+        before = len(train)
+        train = [p for p in train if p.name not in exclude_ids]
+        print(f"Excluded {before - len(train)} patient(s) from fold {fold_number}'s training "
+              f"split (of {len(exclude_ids)} requested -- some may belong to this fold's val "
+              f"split instead, where they are deliberately left in): {sorted(exclude_ids)}")
     # return patients_dir
     train_dataset = Brats(train, training=True,  debug=debug,
                           normalisation=normalisation)
